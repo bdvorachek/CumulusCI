@@ -81,6 +81,18 @@ tasks:
         description: Waits on a batch apex or queueable apex job to finish.
         class_path: cumulusci.tasks.apex.batch.BatchApexWait
         group: Salesforce
+    bitbucket_package_data:
+        description: Look up 2gp package dependencies for a version id recorded in a commit status.
+        class_path: cumulusci.tasks.bitbucket.commit_status.GetPackageDataFromCommitStatus
+        group: Bitbucket
+    bitbucket_create_commit_status:
+        description: Add a commit status to a Bitbucket commit.
+        class_path: cumulusci.tasks.bitbucket.create_commit_status.CreatePackageDataCommitStatus
+        group: Bitbucket
+    bitbucket_release:
+        description: Creates a release Tag for a given managed package version number
+        class_path: cumulusci.tasks.bitbucket.CreateRelease
+        group: Bitbucket
     check_my_domain_active:
         description: Runs as a preflight check to determine whether My Domain is active.
         class_path: cumulusci.tasks.preflight.settings.CheckMyDomainActive
@@ -1056,6 +1068,24 @@ flows:
                 task: uninstall_post
             2:
                 task: uninstall_managed
+    install_2gp_commit_bitbucket:
+        group: Install / Uninstall
+        description: Install the 2GP package for the current commit
+        steps:
+            1:
+                task: bitbucket_package_data
+                options:
+                    context: $project_config.project__git__2gp_context
+            2:
+                flow: dependencies
+                options:
+                    update_dependencies:
+                        resolution_strategy: commit_status
+                        dependencies: ^^bitbucket_package_data.dependencies
+            3:
+                task: install_managed
+                options:
+                    version: ^^bitbucket_package_data.version_id
     install_2gp_commit:
         group: Install / Uninstall
         description: Install the 2GP package for the current commit
@@ -1385,6 +1415,20 @@ services:
                 description: Client Secret/Consumer Secret from the Connected App
                 required: True
                 sensitive: True
+    bitbucket:
+        description: Configure connection for Bitbucket tasks, e.g. Create Release
+        attributes:
+            username:
+                description: The Bitbucket username to use for tasks.
+                required: True
+            app_password:
+                description: The Bitbucket password to use for tasks.
+                required: True
+                sensitive: True
+            workspace:
+                description: The Bitbucket workspace to use for tasks.
+                required: True
+        validator: cumulusci.core.bitbucket.validate_service
     devhub:
         description: Configure which SFDX org to use as a Dev Hub for creating scratch orgs
         attributes:

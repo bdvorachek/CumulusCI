@@ -584,7 +584,7 @@ class TestResolverAccess:
             get_resolver(
                 DependencyResolutionStrategy.STATIC_TAG_REFERENCE,
                 GitHubDynamicDependency(github="https://github.com/SFDO-Tooling/Test"),
-            ),
+            )[0],
             GitHubTagResolver,
         )
 

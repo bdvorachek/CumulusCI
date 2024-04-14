@@ -200,7 +200,7 @@ def validate_service(options: dict, keychain) -> dict:
             f"Service username and token username do not match. ({str(e)})"
         )
     except Exception as e:
-        warning_msg = format_github3_exception(e) or str(e)
+        warning_msg = _format_github3_exception(e) or str(e)
         raise GithubException(
             f"Could not confirm access to the GitHub API: {warning_msg}"
         )
@@ -213,9 +213,9 @@ def validate_service(options: dict, keychain) -> dict:
         repo_generator = gh.repositories()
         _ = next(repo_generator, None)
         repo_response = repo_generator.last_response
-        options["scopes"] = ", ".join(sorted(get_oauth_scopes(repo_response)))
+        options["scopes"] = ", ".join(sorted(_get_oauth_scopes(repo_response)))
 
-        unauthorized_org_ids = get_sso_disabled_orgs(repo_response)
+        unauthorized_org_ids = _get_sso_disabled_orgs(repo_response)
         unauthorized_orgs = {
             k: member_orgs[k] for k in unauthorized_org_ids if k in member_orgs
         }
@@ -406,7 +406,7 @@ def find_repo_commit_status_context(
 
 def get_tag_by_name(repo: Repository, tag_name: str) -> Tag:
     """Fetches a tag by name from the given repository"""
-    ref: Reference = get_ref_for_tag(repo, tag_name)
+    ref: Reference = _get_ref_for_tag(repo, tag_name)
     try:
         return repo.tag(ref.object.sha)
     except github3.exceptions.NotFoundError:
@@ -416,7 +416,7 @@ def get_tag_by_name(repo: Repository, tag_name: str) -> Tag:
         raise GithubApiNotFoundError(msg)
 
 
-def get_ref_for_tag(repo: Repository, tag_name: str) -> Reference:
+def _get_ref_for_tag(repo: Repository, tag_name: str) -> Reference:
     """Gets a Reference object for the tag with the given name"""
     try:
         return repo.ref(f"tags/{tag_name}")
@@ -444,7 +444,7 @@ def get_version_id_from_tag(repo: Repository, tag_name: str) -> str:
     raise DependencyLookupError(f"Could not find version_id for tag {tag_name}")
 
 
-def format_github3_exception(
+def _format_github3_exception(
     exc: Union[ResponseError, TransportError, ConnectionError]
 ) -> str:
     """Checks github3 exceptions for the most common GitHub authentication
@@ -468,7 +468,7 @@ def format_github3_exception(
 
     if isinstance(exc, ResponseError):
         scope_error_msg = check_github_scopes(exc)
-        sso_error_msg = check_github_sso_auth(exc)
+        sso_error_msg = _check_github_sso_auth(exc)
         user_warning = scope_error_msg + sso_error_msg
 
     if isinstance(exc, ConnectionError):
@@ -480,7 +480,7 @@ def format_github3_exception(
     return user_warning
 
 
-def warn_oauth_restricted(exc: ResponseError) -> str:
+def _warn_oauth_restricted(exc: ResponseError) -> str:
     user_warning = ""
 
     is_403 = exc.response.status_code == 403
@@ -510,7 +510,7 @@ def check_github_scopes(exc: ResponseError) -> str:
     if has_wrong_status_code:
         return user_warning
 
-    token_scopes = get_oauth_scopes(exc.response)
+    token_scopes = _get_oauth_scopes(exc.response)
 
     # Gist resource won't return X-Accepted-OAuth-Scopes for some reason, so this
     # string might be `None`; we discard the empty string if so.
@@ -533,7 +533,7 @@ def check_github_scopes(exc: ResponseError) -> str:
     return user_warning
 
 
-def check_github_sso_auth(exc: ResponseError) -> str:
+def _check_github_sso_auth(exc: ResponseError) -> str:
     """
     Check ResponseError header for SSO authorization and return a warning if
     required
@@ -558,13 +558,13 @@ def check_github_sso_auth(exc: ResponseError) -> str:
         # In cases where we don't have complete results we get the
         # partal-results header, so return the organization IDs. This may or
         # may not be useful without help from us to lookup the org IDs.
-        unauthorized_org_ids = get_sso_disabled_orgs(exc.response)
+        unauthorized_org_ids = _get_sso_disabled_orgs(exc.response)
         user_warning = f"{SSO_WARNING} {unauthorized_org_ids}"
 
     return user_warning
 
 
-def get_sso_disabled_orgs(response: Response) -> list:
+def _get_sso_disabled_orgs(response: Response) -> list:
     """
     Given a response from Github, return a list of organization IDs without SSO
     grants.
@@ -579,7 +579,7 @@ def get_sso_disabled_orgs(response: Response) -> list:
     return disabled_orgs
 
 
-def get_oauth_scopes(response: Response) -> set:
+def _get_oauth_scopes(response: Response) -> set:
     """
     Given a response from Github, return the set of OAuth scopes for its
     request.
@@ -604,13 +604,13 @@ def catch_common_github_auth_errors(func: Callable) -> Callable:
         try:
             return func(*args, **kwargs)
         except (ConnectionError) as exc:
-            if error_msg := format_github3_exception(exc):
+            if error_msg := _format_github3_exception(exc):
                 raise GithubApiError(error_msg) from exc
             else:
                 raise
         except (ResponseError, TransportError) as exc:
-            if error_msg := format_github3_exception(exc):
-                url = request_url_from_exc(exc)
+            if error_msg := _format_github3_exception(exc):
+                url = _request_url_from_exc(exc)
                 error_msg = f"{url}\n{error_msg}".strip()
                 raise GithubApiError(error_msg) from exc
             else:
@@ -619,14 +619,14 @@ def catch_common_github_auth_errors(func: Callable) -> Callable:
     return inner
 
 
-def request_url_from_exc(exc: Union[ResponseError, TransportError]) -> str:
+def _request_url_from_exc(exc: Union[ResponseError, TransportError]) -> str:
     if isinstance(exc, TransportError):
         return exc.exception.response.url
     else:
         return exc.response.url
 
 
-def get_oauth_device_flow_token():
+def _get_oauth_device_flow_token():
     """Interactive github authorization"""
     config = OAuth2ClientConfig(**OAUTH_DEVICE_APP)
     device_code = OAuth2DeviceConfig(**get_device_code(config))

@@ -11,6 +11,7 @@ from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Union
 
+from atlassian.bitbucket import Cloud
 from github3 import GitHub
 from github3.repos.repo import Repository
 
@@ -29,6 +30,7 @@ from cumulusci.core.config.base_task_flow_config import BaseTaskFlowConfig
 from cumulusci.core.exceptions import (
     ConfigError,
     GithubException,
+    BitbucketException,
     KeychainNotFound,
     NamespaceNotFoundError,
     NotInProject,
@@ -39,6 +41,9 @@ from cumulusci.core.github import (
     find_previous_release,
     get_github_api_for_repo,
 )
+
+from cumulusci.core.bitbucket import get_bitbucket_cloud_api, get_bitbucket_cloud_api_for_repo
+from atlassian.bitbucket.cloud.repositories import Repository as BitbucketRepository
 from cumulusci.core.source import GitHubSource, LocalFolderSource, NullSource
 from cumulusci.core.utils import merge_config
 from cumulusci.utils.fileutils import FSResource, open_fs_resource
@@ -436,6 +441,9 @@ class BaseProjectConfig(BaseTaskFlowConfig, ProjectConfigPropertiesMixin):
                         ):
                             return parts[0]
 
+    def get_bitbucket_api(self) -> Cloud:
+        return get_bitbucket_cloud_api(self.keychain)
+
     def get_github_api(self, url: Optional[str] = None) -> GitHub:
         return get_github_api_for_repo(self.keychain, url or self.repo_url)
 
@@ -449,7 +457,24 @@ class BaseProjectConfig(BaseTaskFlowConfig, ProjectConfigPropertiesMixin):
             )
         return repo
 
+    def get_repo_bitbucket(self) -> BitbucketRepository:
+        repo = get_bitbucket_cloud_api_for_repo(self.keychain, self.repo_owner, self.repo_name)
+        if repo is None:
+            raise BitbucketException(
+                f"Bitbucket repository not found or not authorized. ({self.repo_url})"
+            )
+        return repo
+
+    def get_latest_tag_bitbucket(self, beta: bool = False) -> str:
+        """Query Bitbucket to find the latest production or beta tag"""
+        repo = self.get_repo_bitbucket()
+        if not beta:
+            return self._get_latest_tag_for_prefix_bitbucket(repo, self.project__git__prefix_release)
+        else:
+            return self._get_latest_tag_for_prefix(repo, self.project__git__prefix_beta)
+
     # TODO: These methods are duplicative with `find_latest_release()`
+    # He's right.
     def get_latest_tag(self, beta: bool = False) -> str:
         """Query Github Releases to find the latest production or beta tag"""
         repo = self.get_repo()
@@ -465,6 +490,18 @@ class BaseProjectConfig(BaseTaskFlowConfig, ProjectConfigPropertiesMixin):
         else:
             return self._get_latest_tag_for_prefix(repo, self.project__git__prefix_beta)
 
+    def _get_latest_tag_for_prefix_bitbucket(self, repo: BitbucketRepository, prefix: str) -> str:
+        versions = [
+            {'tag': tag, 'version': LooseVersion(tag.name.replace(prefix, ""))}
+            for tag in repo.tags.each(f'name ~ "{prefix}"')
+        ]
+        versions.sort(key=lambda x: x['version'], reverse=True)
+        if len(versions) == 0:
+            raise BitbucketException(
+                f"No release found for {self.repo_url} with tag prefix {prefix}"
+            )
+        return versions[0]['tag'].name
+
     def _get_latest_tag_for_prefix(self, repo: Repository, prefix: str) -> str:
         for release in repo.releases():
             if not release.tag_name.startswith(prefix):
@@ -473,6 +510,13 @@ class BaseProjectConfig(BaseTaskFlowConfig, ProjectConfigPropertiesMixin):
         raise GithubException(
             f"No release found for {self.repo_url} with tag prefix {prefix}"
         )
+
+    def get_latest_version_bitbucket(self, beta: bool = False) -> Optional[LooseVersion]:
+        """Query Bitbucket to find the latest production or beta release"""
+        tag = self.get_latest_tag_bitbucket(beta)
+        version = self.get_version_for_tag(tag)
+        if version is not None:
+            return LooseVersion(version)
 
     def get_latest_version(self, beta: bool = False) -> Optional[LooseVersion]:
         """Query Github Releases to find the latest production or beta release"""
@@ -569,8 +613,10 @@ class BaseProjectConfig(BaseTaskFlowConfig, ProjectConfigPropertiesMixin):
             )
 
     @catch_common_github_auth_errors
-    def get_repo_from_url(self, url: str) -> Optional[Repository]:
+    def get_repo_from_url(self, url: str) -> Optional[Repository | BitbucketRepository]:
         owner, name = split_repo_url(url)
+        if "bitbucket.org" in url:
+            return self.get_bitbucket_api().workspaces.get(owner).repositories.get(name)
         return self.get_github_api(url).repository(owner, name)
 
     def get_task(self, name: str) -> TaskConfig:

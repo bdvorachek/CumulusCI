@@ -38,31 +38,31 @@ from cumulusci.core.github import (
     _determine_github_client,
     add_labels_to_pull_request,
     catch_common_github_auth_errors,
-    check_github_sso_auth,
+    _check_github_sso_auth,
     create_gist,
     create_pull_request,
-    format_github3_exception,
+    _format_github3_exception,
     get_auth_from_service,
     get_commit,
     get_github_api,
     get_github_api_for_repo,
     get_latest_prerelease,
-    get_oauth_device_flow_token,
-    get_oauth_scopes,
+    _get_oauth_device_flow_token,
+    _get_oauth_scopes,
     get_pull_requests_by_commit,
     get_pull_requests_by_head,
     get_pull_requests_with_base_branch,
-    get_ref_for_tag,
-    get_sso_disabled_orgs,
+    _get_ref_for_tag,
+    _get_sso_disabled_orgs,
     get_tag_by_name,
     get_version_id_from_tag,
     is_label_on_pull_request,
     is_pull_request_merged,
     markdown_link_to_pr,
-    request_url_from_exc,
+    _request_url_from_exc,
     validate_gh_enterprise,
     validate_service,
-    warn_oauth_restricted,
+    _warn_oauth_restricted,
 )
 from cumulusci.core.keychain import BaseProjectKeychain
 from cumulusci.tasks.github.tests.util_github_api import GithubApiTestMixin
@@ -507,7 +507,7 @@ class TestGithub(GithubApiTestMixin):
             json=self._get_expected_tag_ref("tag_SHA", "tag_SHA"),
             status=200,
         )
-        ref = get_ref_for_tag(repo, "tag_SHA")
+        ref = _get_ref_for_tag(repo, "tag_SHA")
         assert ref.object.sha == "tag_SHA"
 
     @responses.activate
@@ -520,7 +520,7 @@ class TestGithub(GithubApiTestMixin):
             status=404,
         )
         with pytest.raises(GithubApiNotFoundError):
-            get_ref_for_tag(repo, "tag_SHA")
+            _get_ref_for_tag(repo, "tag_SHA")
 
     @responses.activate
     def test_get_version_id_from_tag(self, repo):
@@ -591,32 +591,32 @@ class TestGithub(GithubApiTestMixin):
     def test_get_oauth_scopes(self):
         resp = Response()
         resp.headers["X-OAuth-Scopes"] = "repo, user"
-        assert {"repo", "user"} == get_oauth_scopes(resp)
+        assert {"repo", "user"} == _get_oauth_scopes(resp)
 
         resp = Response()
         resp.headers["X-OAuth-Scopes"] = "repo"
-        assert {"repo"} == get_oauth_scopes(resp)
+        assert {"repo"} == _get_oauth_scopes(resp)
 
         resp = Response()
-        assert set() == get_oauth_scopes(resp)
+        assert set() == _get_oauth_scopes(resp)
 
     def test_get_sso_disabled_orgs(self):
         resp = Response()
-        assert [] == get_sso_disabled_orgs(resp)
+        assert [] == _get_sso_disabled_orgs(resp)
 
         resp = Response()
         resp.headers["X-Github-Sso"] = "partial-results; organizations=0810298,20348880"
-        assert ["0810298", "20348880"] == get_sso_disabled_orgs(resp)
+        assert ["0810298", "20348880"] == _get_sso_disabled_orgs(resp)
 
     def test_check_github_sso_no_forbidden(self):
         resp = Response()
         resp.status_code = 401
         exc = AuthenticationFailed(resp)
-        assert check_github_sso_auth(exc) == ""
+        assert _check_github_sso_auth(exc) == ""
 
         resp.status_code = 403
         exc = ForbiddenError(resp)
-        assert check_github_sso_auth(exc) == ""
+        assert _check_github_sso_auth(exc) == ""
 
     @mock.patch("webbrowser.open")
     def test_check_github_sso_unauthorized_token(self, browser_open):
@@ -626,7 +626,7 @@ class TestGithub(GithubApiTestMixin):
         resp.headers["X-Github-Sso"] = f"required; url={auth_url}"
         exc = ForbiddenError(resp)
 
-        check_github_sso_auth(exc)
+        _check_github_sso_auth(exc)
 
         browser_open.assert_called_with(auth_url)
 
@@ -637,7 +637,7 @@ class TestGithub(GithubApiTestMixin):
         exc = ForbiddenError(resp)
 
         expected_err_msg = f"{SSO_WARNING} ['0810298', '20348880']"
-        actual_error_msg = check_github_sso_auth(exc).strip()
+        actual_error_msg = _check_github_sso_auth(exc).strip()
         assert expected_err_msg == actual_error_msg
 
     def test_github_oauth_org_restricted(self):
@@ -648,7 +648,7 @@ class TestGithub(GithubApiTestMixin):
         exc = ForbiddenError(resp)
 
         expected_warning = "You may also use a Personal Access Token as a workaround."
-        actual_error_msg = warn_oauth_restricted(exc)
+        actual_error_msg = _warn_oauth_restricted(exc)
         assert expected_warning in actual_error_msg
 
     def test_format_gh3_exc_retry(self):
@@ -657,7 +657,7 @@ class TestGithub(GithubApiTestMixin):
         message = "Max retries exceeded with url: foo (Caused by ResponseError('too many 401 error responses',))"
         base_exc = RetryError(message, response=resp)
         exc = TransportError(base_exc)
-        assert UNAUTHORIZED_WARNING == format_github3_exception(exc)
+        assert UNAUTHORIZED_WARNING == _format_github3_exception(exc)
 
     def test_format_gh3_self_signed_ssl(self):
         resp = Response()
@@ -665,12 +665,12 @@ class TestGithub(GithubApiTestMixin):
         message = "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self signed certificate in certificate chain"
         base_exc = SSLError(message, response=resp)
         exc = ConnectionError(base_exc)
-        assert SELF_SIGNED_WARNING == format_github3_exception(exc)
+        assert SELF_SIGNED_WARNING == _format_github3_exception(exc)
 
         # Test passsthrough of other conenction errors
         base_exc = SSLError(response=resp)
         exc = ConnectionError(base_exc)
-        assert format_github3_exception(exc) == ""
+        assert _format_github3_exception(exc) == ""
 
     def test_format_url_from_exc(self):
         resp = Response()
@@ -680,8 +680,8 @@ class TestGithub(GithubApiTestMixin):
         base_exc = RetryError(message, response=resp)
         exc = TransportError(base_exc)
         resp_exc = ResponseError(resp)
-        assert expected_url == request_url_from_exc(exc)
-        assert expected_url == request_url_from_exc(resp_exc)
+        assert expected_url == _request_url_from_exc(exc)
+        assert expected_url == _request_url_from_exc(resp_exc)
 
     def test_catch_common_decorator(self):
         resp = Response()
@@ -873,7 +873,7 @@ class TestGithub(GithubApiTestMixin):
             "scope": "gist,repo",
         }
 
-        returned_token = get_oauth_device_flow_token()
+        returned_token = _get_oauth_device_flow_token()
 
         assert returned_token == "expected_access_token"
         get_token.assert_called_once()

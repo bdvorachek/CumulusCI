@@ -1,3 +1,4 @@
+from github3.repos import Repository
 from cumulusci.core.github import get_github_api_for_repo
 from cumulusci.core.tasks import BaseTask
 
@@ -10,7 +11,7 @@ class BaseGithubTask(BaseTask):
             self.project_config.keychain, self.project_config.repo_url
         )
 
-    def get_repo(self):
+    def get_repo(self) -> Repository:
         return self.github.repository(
             self.project_config.repo_owner, self.project_config.repo_name
         )

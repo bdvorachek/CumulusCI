@@ -195,6 +195,11 @@ class GithubException(CumulusCIException):
 
     pass
 
+class BitbucketException(CumulusCIException):
+    """Raise for errors related to Bitbucket"""
+
+    pass
+
 
 class GithubApiError(CumulusCIException):
     pass

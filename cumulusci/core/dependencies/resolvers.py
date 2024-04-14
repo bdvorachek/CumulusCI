@@ -1,6 +1,12 @@
 import abc
 import itertools
+import pdb
 from typing import Callable, Iterable, List, Optional, Tuple, Union
+
+from atlassian.bitbucket.cloud.repositories import Repository as BitbucketRepository
+from atlassian.bitbucket.cloud.repositories.refs import Branch as BitbucketBranch
+from atlassian.bitbucket.cloud.repositories.commits import Commit as BitbucketCommit
+from cumulusci.utils.version_strings import LooseVersion
 
 from github3.exceptions import NotFoundError
 from github3.repos.branch import Branch
@@ -9,6 +15,7 @@ from github3.repos.repo import Repository
 
 from cumulusci.core.config.project_config import BaseProjectConfig
 from cumulusci.core.dependencies.dependencies import (
+    BaseBitbucketDependency,
     BaseGitHubDependency,
     Dependency,
     DependencyPin,
@@ -25,8 +32,12 @@ from cumulusci.core.dependencies.github import (
     get_remote_project_config,
     get_repo,
 )
+
+import cumulusci.core.dependencies.bitbucket as bitbucket
+import cumulusci.core.bitbucket as bitbucket_core
+
 from cumulusci.core.enums import StrEnum
-from cumulusci.core.exceptions import CumulusCIException, DependencyResolutionError
+from cumulusci.core.exceptions import CumulusCIException, DependencyResolutionError, BitbucketException
 from cumulusci.core.github import (
     find_latest_release,
     find_repo_feature_prefix,
@@ -75,6 +86,58 @@ class AbstractResolver(abc.ABC):
 
     def __str__(self):
         return self.name
+
+
+# TODO Fix this class
+class BitbucketTagResolver(AbstractResolver):
+    """Resolver that identifies a ref by a specific Bitbucket tag."""
+
+    name = "Bitbucket Tag Resolver"
+
+    def can_resolve(self, dep: DynamicDependency, context: BaseProjectConfig) -> bool:
+        return isinstance(dep, BaseBitbucketDependency) and dep.tag is not None
+
+    def resolve(
+        self, dep: BaseBitbucketDependency, context: BaseProjectConfig
+    ) -> Tuple[Optional[str], Optional[StaticDependency]]:
+        try:
+            # Find the bitbucket release corresponding to this tag.
+            repo = bitbucket.get_repo(dep.bitbucket, context)
+            tag = repo.tags.get(dep.tag)
+            ref = tag.hash
+            package_config = bitbucket.get_remote_project_config(repo, ref)
+            package_name, namespace = bitbucket.get_package_data(package_config)
+            version_id, package_type = bitbucket.get_package_details_from_tag(tag)
+
+            install_unmanaged = (
+                dep.is_unmanaged  # We've been told to use this dependency unmanaged
+                or not (
+                    # We will install managed if:
+                    namespace  # the package has a namespace
+                    or version_id  # or is a non-namespaced Unlocked Package
+                )
+            )
+
+            if install_unmanaged:
+                return ref, None
+            else:
+                if package_type is PackageType.SECOND_GEN:
+                    package_dep = PackageVersionIdDependency(
+                        version_id=version_id,
+                        version_number=tag.name,
+                        package_name=package_name,
+                    )
+                else:
+                    package_dep = PackageNamespaceVersionDependency(
+                        namespace=namespace,
+                        version=tag.name,
+                        package_name=package_name,
+                        version_id=version_id,
+                    )
+
+                return (ref, package_dep)
+        except NotFoundError:
+            raise DependencyResolutionError(f"No release found for tag {dep.tag}")
 
 
 class GitHubTagResolver(AbstractResolver):
@@ -129,6 +192,64 @@ class GitHubTagResolver(AbstractResolver):
             raise DependencyResolutionError(f"No release found for tag {dep.tag}")
 
 
+# TODO: Fix all the copilot stuff in this class
+class BitbucketReleaseTagResolver(AbstractResolver):
+    """Resolver that identifies a ref by finding the latest Bitbucket release."""
+
+    name = "Bitbucket Release Resolver"
+    include_beta = False
+
+    def can_resolve(self, dep: DynamicDependency, context: BaseProjectConfig) -> bool:
+        return isinstance(dep, BaseBitbucketDependency)
+
+    def resolve(
+        self, dep: BaseBitbucketDependency, context: BaseProjectConfig
+    ) -> Tuple[Optional[str], Optional[StaticDependency]]:
+        prefix = context.project__git__prefix_beta if self.include_beta else context.project__git__prefix_release
+        repo = bitbucket.get_repo(dep.bitbucket, context)
+        versions = [
+            {'tag': tag, 'version': LooseVersion(tag.name.replace(prefix, ""))}
+            for tag in repo.tags.each(f'name ~ "{prefix}"')
+        ]
+        versions.sort(key=lambda x: x['version'], reverse=True)
+        if len(versions) == 0:
+            raise BitbucketException(
+                f"No release found for {repo.name} with tag prefix {prefix}"
+            )
+        tag = repo.tags.get(versions[0]['tag'].name)
+        version_id, package_type = bitbucket.get_package_details_from_tag(tag)
+        ref = tag.get_data('target').get('hash')
+        package_config = bitbucket.get_remote_project_config(repo, ref)
+        package_name, namespace = bitbucket.get_package_data(package_config)
+
+        install_unmanaged = (
+            dep.is_unmanaged  # We've been told to use this dependency unmanaged
+            or not (
+                # We will install managed if:
+                namespace  # the package has a namespace
+                or version_id  # or is a non-namespaced Unlocked Package
+            )
+        )
+
+        if install_unmanaged:
+            return ref, None
+        else:
+            if package_type is PackageType.SECOND_GEN:
+                package_dep = PackageVersionIdDependency(
+                    version_id=version_id,
+                    version_number=versions[0]['version'].vstring,
+                    package_name=package_name,
+                )
+            else:
+                package_dep = PackageNamespaceVersionDependency(
+                    namespace=namespace,
+                    version=versions[0]['version'].vstring,
+                    package_name=package_name,
+                    version_id=version_id,
+                )
+            return ref, package_dep
+
+
 class GitHubReleaseTagResolver(AbstractResolver):
     """Resolver that identifies a ref by finding the latest GitHub release."""
 
@@ -176,9 +297,16 @@ class GitHubReleaseTagResolver(AbstractResolver):
                         package_name=package_name,
                         version_id=version_id,
                     )
-                return (ref, package_dep)
+                return ref, package_dep
 
-        return (None, None)
+        return None, None
+
+
+class BitbucketBetaReleaseTagResolver(BitbucketReleaseTagResolver):
+    """Resolver that identifies a ref by finding the latest Bitbucket release, including betas."""
+
+    name = "Bitbucket Release Resolver (Betas)"
+    include_beta = True
 
 
 class GitHubBetaReleaseTagResolver(GitHubReleaseTagResolver):
@@ -219,6 +347,29 @@ def get_release_id(context: BaseProjectConfig) -> int:
     return int(release_id)
 
 
+def locate_commit_status_package_id_bitbucket(
+        remote_repo: BitbucketRepository, release_branch: BitbucketBranch, context_2gp: str
+) -> Tuple[Optional[str], Optional[BitbucketCommit]]:
+    """Given a branch on a remote repo, walk the first 5 commits looking
+    for a commit status equal to context_2gp and attempt to parse a
+    package version id from the commit status detail."""
+    version_id = None
+    count = 0
+    commit = release_branch.get_data('target')
+    while version_id is None and count < 5:
+        version_id = bitbucket_core.get_version_id_from_commit(remote_repo, commit.get('hash'), context_2gp)
+        if version_id:
+            break
+        count += 1
+        if commit.get('parents'):
+            commit = remote_repo.commits.get(commit.get('parents')[0].get('hash'))
+        else:
+            commit = None
+            break
+
+    return version_id, commit
+
+
 def locate_commit_status_package_id(
     remote_repo: Repository, release_branch: Branch, context_2gp: str
 ) -> Tuple[Optional[str], Optional[Union[RepoCommit, ShortCommit]]]:
@@ -242,11 +393,74 @@ def locate_commit_status_package_id(
     return version_id, commit
 
 
+def get_remote_context_bitbucket(
+        repo: BitbucketRepository, commit_status_context: str, default_context: str
+) -> str:
+    default_branch = repo.get_data("mainbranch").get("name")
+    config = bitbucket.get_remote_project_config(repo, default_branch)
+    return config.lookup(f"project__git__{commit_status_context}") or default_context
+
+
 def get_remote_context(
     repo: Repository, commit_status_context: str, default_context: str
 ) -> str:
     config = get_remote_project_config(repo, repo.default_branch)
     return config.lookup(f"project__git__{commit_status_context}") or default_context
+
+
+class AbstractBitbucketCommitStatusPackageResolver(AbstractResolver, abc.ABC):
+    commit_status_context = ""
+    commit_status_default = ""
+
+    def can_resolve(self, dep: DynamicDependency, context: BaseProjectConfig) -> bool:
+        return self.is_valid_repo_context(context) and isinstance(
+            dep, BaseBitbucketDependency
+        )
+
+    def is_valid_repo_context(self, context: BaseProjectConfig) -> bool:
+        return bool(context.repo_branch and context.project__git__prefix_feature)
+
+    @abc.abstractmethod
+    def get_branches(
+        self,
+        dep: BaseBitbucketDependency,
+        context: BaseProjectConfig,
+    ) -> List[Branch]:
+        ...
+
+    def resolve(
+        self, dep: BaseBitbucketDependency, context: BaseProjectConfig
+    ) -> Tuple[Optional[str], Optional[StaticDependency]]:
+        branches = self.get_branches(dep, context)
+
+        # We know `repo` is not None because `get_branches()` will raise in that case.
+        repo = context.get_repo_from_url(dep.bitbucket)
+        clone_url = repo.get_data("links").get("clone")[0].get("href")
+        remote_context = get_remote_context_bitbucket(
+            repo, self.commit_status_context, self.commit_status_default
+        )
+        for branch in branches:
+            version_id, commit = locate_commit_status_package_id_bitbucket(
+                repo,
+                branch,
+                remote_context,
+            )
+
+            if version_id and commit:
+                context.logger.info(
+                    f"{self.name} located package version {version_id} on branch {branch.name} on {clone_url} at commit {branch.get_data('target').get('hash')}"
+                )
+                package_config = bitbucket.get_remote_project_config(repo, commit.get('hash'))
+                package_name, _ = bitbucket.get_package_data(package_config)
+
+                return commit.get('hash'), PackageVersionIdDependency(
+                    version_id=version_id, package_name=package_name
+                )
+
+        context.logger.warn(
+            f"{self.name} did not locate package package version on {clone_url}."
+        )
+        return None, None
 
 
 class AbstractGitHubCommitStatusPackageResolver(AbstractResolver, abc.ABC):
@@ -290,9 +504,9 @@ class AbstractGitHubCommitStatusPackageResolver(AbstractResolver, abc.ABC):
 
             if version_id and commit:
                 context.logger.info(
-                    f"{self.name} located package version {version_id} on branch {branch.name} on {repo.clone_url} at commit {branch.commit.sha}"
+                    f"{self.name} located package version {version_id} on branch {branch.name} on {repo.clone_url} at commit {branch.get_data('target').get('hash')}"
                 )
-                package_config = get_remote_project_config(repo, commit.sha)
+                package_config = get_remote_project_config(repo, commit.get('hash'))
                 package_name, _ = get_package_data(package_config)
 
                 return commit.sha, PackageVersionIdDependency(
@@ -303,6 +517,56 @@ class AbstractGitHubCommitStatusPackageResolver(AbstractResolver, abc.ABC):
             f"{self.name} did not locate package package version on {repo.clone_url}."
         )
         return (None, None)
+
+
+class AbstractBitbucketReleaseBranchResolver(AbstractBitbucketCommitStatusPackageResolver, abc.ABC):
+    """Abstract base class for resolvers that use commit statuses on release branches to find refs."""
+
+    branch_offset_start = 0
+    branch_offset_end = 0
+
+    def is_valid_repo_context(self, context: BaseProjectConfig) -> bool:
+        return bool(
+            super().is_valid_repo_context(context)
+            and is_release_branch_or_child(
+                context.repo_branch, context.project__git__prefix_feature  # type: ignore
+            )
+        )
+
+    def get_branches(
+        self,
+        dep: BaseBitbucketDependency,
+        context: BaseProjectConfig,
+    ) -> List[Branch]:
+        release_id = get_release_id(context)
+        repo = context.get_repo_from_url(dep.bitbucket)
+        if not repo:
+            raise DependencyResolutionError(
+                f"Unable to access Bitbucket repository for {dep.bitbucket}"
+            )
+
+        try:
+            remote_branch_prefix = bitbucket_core.find_repo_feature_prefix(repo)
+        except Exception:
+            context.logger.info(
+                f"Could not find feature branch prefix or commit-status context for {repo.name}. Unable to resolve packages."
+            )
+            return []
+
+        # We will check at least the release branch corresponding to our release id.
+        # We may be configured to check backwards on release branches.
+        release_branches = []
+        for i in range(self.branch_offset_start, self.branch_offset_end):
+            remote_matching_branch = construct_release_branch_name(
+                remote_branch_prefix, str(release_id - i)
+            )
+            try:
+                release_branches.append(repo.branches.get(remote_matching_branch))
+            except NotFoundError:
+                context.logger.info(f"Remote branch {remote_matching_branch} not found")
+                pass
+
+        return release_branches
 
 
 class AbstractGitHubReleaseBranchResolver(
@@ -334,7 +598,7 @@ class AbstractGitHubReleaseBranchResolver(
             )
 
         try:
-            remote_branch_prefix = find_repo_feature_prefix(repo)
+            remote_branch_prefix = bitbucket_core.find_repo_feature_prefix(repo)
         except Exception:
             context.logger.info(
                 f"Could not find feature branch prefix or commit-status context for {repo.clone_url}. Unable to resolve packages."
@@ -355,6 +619,17 @@ class AbstractGitHubReleaseBranchResolver(
                 pass
 
         return release_branches
+
+
+class BitbucketReleaseBranchCommitStatusResolver(AbstractBitbucketReleaseBranchResolver):
+    """Resolver that identifies a ref by finding a beta 2GP package version
+    in a commit status on a `feature/NNN` release branch."""
+
+    name = "Bitbucket Release Branch Commit Status Resolver"
+    commit_status_context = "2gp_context"
+    commit_status_default = "Build Feature Test Package"
+    branch_offset_start = 0
+    branch_offset_end = 1
 
 
 class GitHubReleaseBranchCommitStatusResolver(AbstractGitHubReleaseBranchResolver):
@@ -405,6 +680,44 @@ class GitHubPreviousReleaseBranchUnlockedResolver(AbstractGitHubReleaseBranchRes
     branch_offset_end = 3
 
 
+class AbstractBitbucketExactMatchCommitStatusResolver(
+    AbstractBitbucketCommitStatusPackageResolver, abc.ABC
+):
+    """Abstract base class for resolvers that identify a ref by finding a package version
+    in a commit status on a branch whose name matches the local branch."""
+
+    def get_branches(
+        self,
+        dep: BaseBitbucketDependency,
+        context: BaseProjectConfig,
+    ) -> List[Branch]:
+        repo: BitbucketRepository = context.get_repo_from_url(dep.bitbucket)
+        if not repo:
+            raise DependencyResolutionError(
+                f"Unable to access Bitbucket repository for {dep.bitbucket}"
+            )
+
+        try:
+            remote_branch_prefix = bitbucket_core.find_repo_feature_prefix(repo)
+        except Exception:
+            context.logger.info(
+                f"Could not find feature branch prefix or commit-status context for {repo.name}. Unable to resolve package."
+            )
+            return []
+
+        # Attempt exact match
+        try:
+            branch = get_feature_branch_name(
+                context.repo_branch, context.project__git__prefix_feature
+            )
+            release_branch = repo.branches.get(f"{remote_branch_prefix}{branch}")
+        except Exception:
+            context.logger.info(f"Exact-match branch not found for {repo.name}.")
+            return []
+
+        return [release_branch]
+
+
 class AbstractGitHubExactMatchCommitStatusResolver(
     AbstractGitHubCommitStatusPackageResolver, abc.ABC
 ):
@@ -443,6 +756,15 @@ class AbstractGitHubExactMatchCommitStatusResolver(
         return [release_branch]
 
 
+class BitbucketExactMatch2GPResolver(AbstractBitbucketExactMatchCommitStatusResolver):
+    """Resolver that identifies a ref by finding a 2GP package version
+    in a commit status on a branch whose name matches the local branch."""
+
+    name = "Bitbucket Exact-Match Commit Status Resolver"
+    commit_status_context = "2gp_context"
+    commit_status_default = "Build Feature Test Package"
+
+
 class GitHubExactMatch2GPResolver(AbstractGitHubExactMatchCommitStatusResolver):
     """Resolver that identifies a ref by finding a 2GP package version
     in a commit status on a branch whose name matches the local branch."""
@@ -463,6 +785,22 @@ class GitHubExactMatchUnlockedCommitStatusResolver(
     commit_status_default = "Build Unlocked Test Package"
 
 
+class AbstractBitbucketDefaultBranchCommitStatusResolver(
+    AbstractBitbucketCommitStatusPackageResolver, abc.ABC
+):
+    """Abstract base class for resolvers that identify a ref by finding a beta package version
+    in a commit status on the repo's default branch."""
+
+    def get_branches(
+        self,
+        dep: BaseBitbucketDependency,
+        context: BaseProjectConfig,
+    ) -> List[Branch]:
+        repo = context.get_repo_from_url(dep.bitbucket)
+        default_branch = repo.get_data("mainbranch").get("name")
+        return [repo.branches.get(default_branch)]
+
+
 class AbstractGitHubDefaultBranchCommitStatusResolver(
     AbstractGitHubCommitStatusPackageResolver, abc.ABC
 ):
@@ -477,6 +815,12 @@ class AbstractGitHubDefaultBranchCommitStatusResolver(
         repo = context.get_repo_from_url(dep.github)
 
         return [repo.branch(repo.default_branch)]
+
+
+class BitbucketDefaultBranch2GPResolver(AbstractBitbucketDefaultBranchCommitStatusResolver):
+    name = "Bitbucket Default Branch Commit Status Resolver"
+    commit_status_context = "2gp_context"
+    commit_status_default = "Build Feature Test Package"
 
 
 class GitHubDefaultBranch2GPResolver(AbstractGitHubDefaultBranchCommitStatusResolver):
@@ -494,18 +838,21 @@ class GitHubDefaultBranchUnlockedCommitStatusResolver(
 
 
 RESOLVER_CLASSES = {
-    DependencyResolutionStrategy.STATIC_TAG_REFERENCE: GitHubTagResolver,
-    DependencyResolutionStrategy.COMMIT_STATUS_EXACT_BRANCH: GitHubExactMatch2GPResolver,
-    DependencyResolutionStrategy.COMMIT_STATUS_RELEASE_BRANCH: GitHubReleaseBranchCommitStatusResolver,
-    DependencyResolutionStrategy.COMMIT_STATUS_PREVIOUS_RELEASE_BRANCH: GitHubPreviousReleaseBranchCommitStatusResolver,
-    DependencyResolutionStrategy.COMMIT_STATUS_DEFAULT_BRANCH: GitHubDefaultBranch2GPResolver,
-    DependencyResolutionStrategy.BETA_RELEASE_TAG: GitHubBetaReleaseTagResolver,
-    DependencyResolutionStrategy.RELEASE_TAG: GitHubReleaseTagResolver,
-    DependencyResolutionStrategy.UNMANAGED_HEAD: GitHubUnmanagedHeadResolver,
-    DependencyResolutionStrategy.UNLOCKED_EXACT_BRANCH: GitHubExactMatchUnlockedCommitStatusResolver,
-    DependencyResolutionStrategy.UNLOCKED_RELEASE_BRANCH: GitHubReleaseBranchUnlockedResolver,
-    DependencyResolutionStrategy.UNLOCKED_PREVIOUS_RELEASE_BRANCH: GitHubPreviousReleaseBranchUnlockedResolver,
-    DependencyResolutionStrategy.UNLOCKED_DEFAULT_BRANCH: GitHubDefaultBranchUnlockedCommitStatusResolver,
+    DependencyResolutionStrategy.STATIC_TAG_REFERENCE: [GitHubTagResolver, BitbucketTagResolver],
+    DependencyResolutionStrategy.COMMIT_STATUS_EXACT_BRANCH: [GitHubExactMatch2GPResolver,
+                                                              BitbucketExactMatch2GPResolver],
+    DependencyResolutionStrategy.COMMIT_STATUS_RELEASE_BRANCH: [GitHubReleaseBranchCommitStatusResolver,
+                                                                BitbucketReleaseBranchCommitStatusResolver],
+    DependencyResolutionStrategy.COMMIT_STATUS_PREVIOUS_RELEASE_BRANCH: [GitHubPreviousReleaseBranchCommitStatusResolver],
+    DependencyResolutionStrategy.COMMIT_STATUS_DEFAULT_BRANCH: [GitHubDefaultBranch2GPResolver,
+                                                                BitbucketDefaultBranch2GPResolver],
+    DependencyResolutionStrategy.BETA_RELEASE_TAG: [GitHubBetaReleaseTagResolver, BitbucketBetaReleaseTagResolver],
+    DependencyResolutionStrategy.RELEASE_TAG: [GitHubReleaseTagResolver, BitbucketReleaseTagResolver],
+    DependencyResolutionStrategy.UNMANAGED_HEAD: [GitHubUnmanagedHeadResolver],
+    DependencyResolutionStrategy.UNLOCKED_EXACT_BRANCH: [GitHubExactMatchUnlockedCommitStatusResolver],
+    DependencyResolutionStrategy.UNLOCKED_RELEASE_BRANCH: [GitHubReleaseBranchUnlockedResolver],
+    DependencyResolutionStrategy.UNLOCKED_PREVIOUS_RELEASE_BRANCH: [GitHubPreviousReleaseBranchUnlockedResolver],
+    DependencyResolutionStrategy.UNLOCKED_DEFAULT_BRANCH: [GitHubDefaultBranchUnlockedCommitStatusResolver],
 }
 
 
@@ -514,12 +861,12 @@ RESOLVER_CLASSES = {
 
 def get_resolver(
     strategy: DependencyResolutionStrategy, dependency: DynamicDependency
-) -> Optional[AbstractResolver]:
+) -> Optional[List[AbstractResolver]]:
     """Return an instance of a resolver class capable of applying the specified
     resolution strategy to the dependency."""
     # This will be fleshed out when further types of DynamicDependency are added.
 
-    return RESOLVER_CLASSES[strategy]()
+    return [i() for i in RESOLVER_CLASSES[strategy]]
 
 
 def get_resolver_stack(
@@ -599,10 +946,10 @@ def get_static_dependencies(
 
         def unique(it: Iterable):
             seen = set()
-
             for each in it:
                 if each not in seen:
                     seen.add(each)
+                    context.logger.info(f"Adding {each} to the dependency list. Current seen list: {seen}")
                     yield each
 
         dependencies = list(
@@ -614,6 +961,8 @@ def get_static_dependencies(
                 ),
             )
         )
+
+        context.logger.info(f"Flattened and resolved dependencies: {dependencies}")
 
     # Make sure, if we had no flattening or resolving to do, that we apply the ignore list.
     # Type is guaranteed via the logic above.
@@ -636,28 +985,27 @@ def resolve_dependency(
 
     if dependency.is_resolved:
         return
-
     for s in strategies:
-        resolver = get_resolver(s, dependency)
-
-        if resolver and resolver.can_resolve(dependency, context):
-            try:
-                dependency.ref, dependency.package_dependency = resolver.resolve(
-                    dependency, context
-                )
-                if dependency.package_dependency:
-                    try:
-                        dependency.package_dependency.password_env_name = (
-                            dependency.password_env_name
-                        )
-                    except AttributeError:  # pragma: no cover
-                        pass
-                if dependency.ref:
-                    break
-            except DependencyResolutionError:
-                context.logger.info(
-                    f"Resolution strategy {s} failed for dependency {dependency}."
-                )
+        resolvers = get_resolver(s, dependency)
+        for resolver in resolvers:
+            if resolver and resolver.can_resolve(dependency, context):
+                try:
+                    dependency.ref, dependency.package_dependency = resolver.resolve(
+                        dependency, context
+                    )
+                    if dependency.package_dependency:
+                        try:
+                            dependency.package_dependency.password_env_name = (
+                                dependency.password_env_name
+                            )
+                        except AttributeError:  # pragma: no cover
+                            pass
+                    if dependency.ref:
+                        break
+                except DependencyResolutionError:
+                    context.logger.info(
+                        f"Resolution strategy {s} failed for dependency {dependency}."
+                    )
 
     if not dependency.ref:
         raise DependencyResolutionError(f"Unable to resolve dependency {dependency}")

@@ -18,6 +18,7 @@ from cumulusci.core.dependencies.github import (
     get_remote_project_config,
     get_repo,
 )
+import cumulusci.core.dependencies.bitbucket as bitbucket_deps
 from cumulusci.core.dependencies.utils import TaskContext
 from cumulusci.core.exceptions import DependencyParseError, DependencyResolutionError
 from cumulusci.core.sfdx import (
@@ -76,6 +77,28 @@ class DependencyPin(HashableBaseModel, abc.ABC):
 
 
 DependencyPin.update_forward_refs()
+
+
+class BitbucketDependencyPin(DependencyPin):
+    """Model representing a request to pin a Bitbucket dependency to a specific tag"""
+
+    bitbucket: str
+    tag: str
+
+    def can_pin(self, d: "DynamicDependency") -> bool:
+        return isinstance(d, BaseBitbucketDependency) and d.bitbucket == self.bitbucket
+
+    def pin(self, d: "BaseBitbucketDependency", context: BaseProjectConfig):
+        from cumulusci.core.dependencies.resolvers import (  # Circular imports
+            BitbucketTagResolver,
+        )
+
+        if d.tag and d.tag != self.tag:
+            raise DependencyResolutionError(
+                f"A pin is specified for {self.bitbucket}, but the dependency already has a tag specified."
+            )
+        d.tag = self.tag
+        d.ref, d.package_dependency = BitbucketTagResolver().resolve(d, context)
 
 
 class GitHubDependencyPin(DependencyPin):
@@ -187,6 +210,29 @@ class DynamicDependency(Dependency, abc.ABC):
         resolve_dependency(self, context, strategies)
 
 
+class BaseBitbucketDependency(DynamicDependency, abc.ABC):
+    """Base class for dynamic dependencies that reference a Bitbucket repo."""
+
+    pin_class = BitbucketDependencyPin
+    bitbucket: Optional[AnyUrl] = None
+
+    tag: Optional[str] = None
+    ref: Optional[str] = None
+
+    @property
+    def is_resolved(self):
+        return bool(self.ref)
+
+    @property
+    def name(self):
+        return f"Dependency: {self.bitbucket}"
+
+    @property
+    @abc.abstractmethod
+    def is_unmanaged(self):
+        pass
+
+
 class BaseGitHubDependency(DynamicDependency, abc.ABC):
     """Base class for dynamic dependencies that reference a GitHub repo."""
 
@@ -266,6 +312,115 @@ class GitHubDynamicSubfolderDependency(BaseGitHubDependency):
     def description(self):
         loc = f" @{self.tag or self.ref}" if self.ref or self.tag else ""
         return f"{self.github}/{self.subfolder}{loc}"
+
+
+class BitbucketDynamicDependency(BaseBitbucketDependency):
+    """A dependency expressed by a reference to a Bitbucket repo, which needs
+    to be resolved to a specific tag."""
+    unmanaged: bool = False
+    namespace_inject: Optional[str] = None
+    namespace_strip: Optional[str] = None
+    password_env_name: Optional[str] = None
+
+    skip: List[str] = []
+
+    @property
+    def is_unmanaged(self):
+        return self.unmanaged
+
+    @pydantic.validator("skip", pre=True)
+    def listify_skip(cls, v):
+        if v and not isinstance(v, list):
+            v = [v]
+        return v
+
+    @pydantic.root_validator
+    def check_unmanaged_values(cls, values):
+        if not values.get("unmanaged") and (
+            values.get("namespace_inject") or values.get("namespace_strip")
+        ):
+            raise ValueError(
+                "The namespace_strip and namespace_inject fields require unmanaged = True"
+            )
+
+        return values
+
+    def flatten(self, context: BaseProjectConfig) -> List[Dependency]:
+        """Find more dependencies based on repository contents.
+
+        Includes:
+        - dependencies from cumulusci.yml
+        - subfolders of unpackaged/pre
+        - the contents of src, if this is not a managed package
+        - subfolders of unpackaged/post
+        """
+        if not self.is_resolved:
+            raise DependencyResolutionError(
+                f"Dependency {self} is not resolved and cannot be flattened."
+            )
+
+        deps = []
+
+        context.logger.info(f"Collecting dependencies from Bitbucket repo {self.bitbucket}")
+        repo = bitbucket_deps.get_repo(self.bitbucket, context)
+
+        package_config = bitbucket_deps.get_remote_project_config(repo, self.ref)
+        _, namespace = bitbucket_deps.get_package_data(package_config)
+
+        # Parse upstream dependencies from the repo's cumulusci.yml
+        # These may be unresolved or unflattened; if so, `get_static_dependencies()`
+        # will manage them.
+        dependencies = package_config.project__dependencies
+        if dependencies:
+            deps.extend([parse_dependency(d) for d in dependencies])
+            if None in deps:
+                raise DependencyResolutionError(
+                    f"Unable to flatten dependency {self} because a transitive dependency could not be parsed."
+                )
+
+        # Check for unmanaged flag on a namespaced package
+        managed = bool(namespace and not self.unmanaged)
+
+        # Look for subfolders under unpackaged/pre
+        # unpackaged/pre is always deployed unmanaged, no namespace manipulation.
+        # deps.extend(
+        #     self._flatten_unpackaged(
+        #         repo, "unpackaged/pre", self.skip, managed=False, namespace=None
+        #     )
+        # )
+
+        if not self.package_dependency:
+            if managed:
+                # We had an expectation of finding a package version and did not.
+                raise DependencyResolutionError(
+                    f"Could not find latest release for {self}"
+                )
+
+            # Deploy the project, if unmanaged.
+            # deps.append(
+            #     UnmanagedGitHubRefDependency(
+            #         github=self.github,
+            #         ref=self.ref,
+            #         unmanaged=self.unmanaged,
+            #         namespace_inject=self.namespace_inject,
+            #         namespace_strip=self.namespace_strip,
+            #     )
+            # )
+        else:
+            deps.append(self.package_dependency)
+
+        # We always inject the project's namespace into unpackaged/post metadata if managed
+        # deps.extend(
+        #     self._flatten_unpackaged(
+        #         repo,
+        #         "unpackaged/post",
+        #         self.skip,
+        #         managed=managed,
+        #         namespace=namespace,
+        #     )
+        # )
+
+        return deps
 
 
 class GitHubDynamicDependency(BaseGitHubDependency):
@@ -634,7 +789,6 @@ class UnmanagedDependency(StaticDependency, abc.ABC):
 
         return api()
 
-
 class UnmanagedGitHubRefDependency(UnmanagedDependency):
     """Static dependency on unmanaged metadata in a specific GitHub ref and subfolder."""
 
@@ -765,6 +919,7 @@ AVAILABLE_DEPENDENCY_CLASSES = [
     UnmanagedZipURLDependency,
     GitHubDynamicDependency,
     GitHubDynamicSubfolderDependency,
+    BitbucketDynamicDependency
 ]
 
 

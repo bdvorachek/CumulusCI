@@ -40,6 +40,7 @@ from cumulusci.utils.git import split_repo_url
 from cumulusci.utils.salesforce.soql import (
     format_subscriber_package_version_where_clause,
 )
+from requests.exceptions import HTTPError
 
 PERSISTENT_ORG_ERROR = """
 Target org scratch org definition file missing. Persistent orgs like a Dev Hub can't be used for 2GP package uploads.
@@ -503,6 +504,16 @@ class CreatePackageVersion(BaseSalesforceApiTask):
             self.logger.info("")
 
             return self._convert_ancestor_id(spv_id)
+        elif spv_id == "latest_bitbucket_release":
+            try:
+                tag_name = self.project_config.get_latest_tag_bitbucket(beta=False)
+            except HTTPError:
+                # No release found
+                return ""
+            repo = self.project_config.get_repo_bitbucket()
+            spv_id = get_version_id_from_tag(repo, tag_name)
+            self.logger.info(f"Resolved ancestor to version: {spv_id}")
+            self.logger.info("")
         else:
             raise TaskOptionsError(f"Unrecognized value for ancestor_id: {spv_id}")
 
@@ -556,6 +567,17 @@ class CreatePackageVersion(BaseSalesforceApiTask):
                     package_type=PackageType.SECOND_GEN,
                 )
             except GithubException:
+                # handle case where there isn't a release yet
+                pass
+        elif version_base == "latest_bitbucket_release":
+            # Get the version of the latest bitbucket release
+            # Bitbucket has no equivalent to github releases, so we use tags instead
+            try:
+                return PackageVersionNumber.parse(
+                    str(self.project_config.get_latest_version_bitbucket(beta=False)),
+                    package_type=PackageType.SECOND_GEN,
+                )
+            except HTTPError:
                 # handle case where there isn't a release yet
                 pass
         else:
